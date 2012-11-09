@@ -10,6 +10,7 @@ import java.net.URLConnection;
 import java.nio.charset.Charset;
 import java.text.MessageFormat;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -22,6 +23,7 @@ import java.util.TreeSet;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -40,6 +42,7 @@ import org.eclipse.core.resources.IResourceDelta;
 import org.eclipse.core.resources.IResourceDeltaVisitor;
 import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.CoreException;
+import org.eclipse.core.runtime.IPath;
 import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.Status;
 import org.eclipse.debug.core.DebugException;
@@ -50,7 +53,7 @@ import org.eclipse.jetty.server.Request;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.handler.AbstractHandler;
 import org.eclipse.jetty.server.nio.SelectChannelConnector;
-import org.eclipse.jetty.util.thread.QueuedThreadPool;
+import org.eclipse.jetty.util.thread.ExecutorThreadPool;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.Shell;
 import org.eclipse.ui.PlatformUI;
@@ -59,6 +62,7 @@ import org.eclipse.wst.jsdt.debug.core.breakpoints.IJavaScriptLoadBreakpoint;
 import org.eclipse.wst.jsdt.debug.core.jsdi.request.StepRequest;
 import org.eclipse.wst.jsdt.debug.core.model.IJavaScriptDebugTarget;
 import org.eclipse.wst.jsdt.debug.core.model.JavaScriptDebugModel;
+import org.eclipse.wst.jsdt.debug.internal.core.breakpoints.JavaScriptExceptionBreakpoint;
 import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
 import org.json.simple.parser.JSONParser;
@@ -85,6 +89,17 @@ import com.mobilesorcery.sdk.ui.UIUtils;
 public class JSODDServer implements IResourceChangeListener {
 
 	static class DebuggerMessage {
+		public static final Comparator<DebuggerMessage> COMPARATOR = new Comparator<DebuggerMessage>() {
+			@Override
+			public int compare(DebuggerMessage o1, DebuggerMessage o2) {
+				int result = o1.type - o2.type;
+				if (result == 0) {
+					return o2.messageId - o1.messageId;
+				}
+				return result;
+			}
+			
+		};
 		static AtomicInteger idCounter = new AtomicInteger(0);
 		int messageId = idCounter.incrementAndGet();
 		AtomicBoolean processed = new AtomicBoolean(false);
@@ -142,7 +157,7 @@ public class JSODDServer implements IResourceChangeListener {
 		private static final int POISON = -1;
 
 		// TODO: Slow refactoring to make this class useful
-		private final HashMap<Integer, LinkedBlockingQueue<DebuggerMessage>> consumers = new HashMap<Integer, LinkedBlockingQueue<DebuggerMessage>>();
+		private final HashMap<Integer, PriorityBlockingQueue<DebuggerMessage>> consumers = new HashMap<Integer, PriorityBlockingQueue<DebuggerMessage>>();
 
 		private final HashMap<Integer, IMessageListener> messageListeners = new HashMap<Integer, IMessageListener>();
 
@@ -167,11 +182,11 @@ public class JSODDServer implements IResourceChangeListener {
 		}
 
 		public DebuggerMessage take(int sessionId) throws InterruptedException {
-			LinkedBlockingQueue<DebuggerMessage> consumer = null;
+			PriorityBlockingQueue<DebuggerMessage> consumer = null;
 			synchronized (queueLock) {
 				consumer = consumers.get(sessionId);
-				LinkedBlockingQueue<DebuggerMessage> newConsumer = new LinkedBlockingQueue<DebuggerMessage>(
-						1024);
+				PriorityBlockingQueue<DebuggerMessage> newConsumer = new PriorityBlockingQueue<DebuggerMessage>(
+						1024, DebuggerMessage.COMPARATOR);
 				if (consumer != null) {
 					consumer.drainTo(newConsumer);
 					consumer.offer(poison());
@@ -204,11 +219,11 @@ public class JSODDServer implements IResourceChangeListener {
 		public void offer(int sessionId, DebuggerMessage msg) {
 			synchronized (queueLock) {
 				if (CoreMoSyncPlugin.getDefault().isDebugging()) {
-					CoreMoSyncPlugin.trace("{2}Ê- OFFER: Session id {0}: {1}",
+					CoreMoSyncPlugin.trace("{2} - OFFER: Session id {0}: {1}",
 							sessionId, msg, new Date().toString());
 					CoreMoSyncPlugin.trace("CONSUMERS: {0}", consumers);
 				}
-				LinkedBlockingQueue<DebuggerMessage> consumer = consumers
+				PriorityBlockingQueue<DebuggerMessage> consumer = consumers
 						.get(sessionId);
 				if (consumer != null) {
 					msg.setOfferTimestamp(System.currentTimeMillis());
@@ -240,8 +255,8 @@ public class JSODDServer implements IResourceChangeListener {
 			try {
 				if (!cd.await(timeout, TimeUnit.SECONDS)) {
 					if (CoreMoSyncPlugin.getDefault().isDebugging()) {
-						CoreMoSyncPlugin.trace("Message timeout (#{0})",
-								sessionId);
+						CoreMoSyncPlugin.trace("{2}s message timeout (#{0}, #{1})",
+								sessionId, msg.getMessageId(), timeout);
 					}
 					throw new TimeoutException();
 				}
@@ -294,7 +309,7 @@ public class JSODDServer implements IResourceChangeListener {
 		public void killSession(int sessionId) {
 			Set<Integer> messageListenerIds = new TreeSet<Integer>();
 			synchronized (queueLock) {
-				LinkedBlockingQueue<DebuggerMessage> sessionQueue = consumers
+				PriorityBlockingQueue<DebuggerMessage> sessionQueue = consumers
 						.remove(sessionId);
 				takeTimestamps.remove(sessionId);
 				if (sessionQueue != null) {
@@ -345,7 +360,7 @@ public class JSODDServer implements IResourceChangeListener {
 				public void run() {
 					pingAll();
 				}
-			}, PING_INTERVAL, 2000);
+			}, PING_INTERVAL, PING_INTERVAL);
 		}
 
 		public void stopPingDeamon() {
@@ -361,7 +376,7 @@ public class JSODDServer implements IResourceChangeListener {
 			// on the client side.
 			// And if the client is disconnected/does not respond we need to
 			// handle that too.
-			HashMap<Integer, LinkedBlockingQueue<DebuggerMessage>> consumersCopy = new HashMap<Integer, LinkedBlockingQueue<DebuggerMessage>>();
+			HashMap<Integer, PriorityBlockingQueue<DebuggerMessage>> consumersCopy = new HashMap<Integer, PriorityBlockingQueue<DebuggerMessage>>();
 			synchronized (queueLock) {
 				 consumersCopy.putAll(consumers);
 			}
@@ -385,9 +400,13 @@ public class JSODDServer implements IResourceChangeListener {
 								sessionId);
 					}
 					pendingPings.add(sessionId);
-					offer(sessionId, ping());
+					ping(sessionId);
 				}
 			}
+		}
+		
+		public void ping(int sessionId) {
+			offer(sessionId, ping());
 		}
 
 		public void heartbeat(int sessionId) {
@@ -647,7 +666,6 @@ public class JSODDServer implements IResourceChangeListener {
 				}
 				result.put("id", queuedElement.getMessageId());
 			} catch (InterruptedException e) {
-				// e.printStackTrace();
 				if (CoreMoSyncPlugin.getDefault().isDebugging()) {
 					CoreMoSyncPlugin
 							.trace("Dropped connection (often temporarily).");
@@ -758,6 +776,7 @@ public class JSODDServer implements IResourceChangeListener {
 			// No caching!
 			res.setHeader("Pragma", "no-cache");
 			res.setHeader("Cache-Control", "no-cache");
+			res.setHeader("Access-Control-Allow-Origin", "*");
 			res.setContentType(guessContentTypeFromName(resource));
 			return source;
 		}
@@ -865,6 +884,8 @@ public class JSODDServer implements IResourceChangeListener {
 					}
 					if (bp instanceof JavaScriptBreakpointDesc) {
 						JavaScriptBreakpointDesc lineBp = (JavaScriptBreakpointDesc) bp;
+						lineBp = syncBreakpoint(lineBp);
+						
 						int lineNo = bp instanceof IJavaScriptLoadBreakpoint ? -1
 								: lineBp.getLineNumber();
 						IResource resource = lineBp.getResource();
@@ -872,7 +893,8 @@ public class JSODDServer implements IResourceChangeListener {
 								: resource.getFullPath().toPortableString();
 						String condition = lineBp.getCondition();
 						int hitCount = lineBp.getHitCount();
-
+						
+						
 						JSONObject jsonBp = new JSONObject();
 						jsonBp.put("file", file);
 						JSODDSupport jsoddSupport = resource.getType() == IResource.FILE ? Html5Plugin
@@ -901,6 +923,28 @@ public class JSODDServer implements IResourceChangeListener {
 			}
 			command.put("data", jsonBps);
 			return command;
+		}
+
+		private JavaScriptBreakpointDesc syncBreakpoint(JavaScriptBreakpointDesc lineBp) {
+			IResource resource = lineBp.getResource();
+			if (resource != null) {
+				IPath path = resource.getFullPath();
+				int lineNo = lineBp.getLineNumber();
+				IJavaScriptLineBreakpoint underlyingBp = JSODDSupport.findBreakPoint(path, lineNo);
+				if (underlyingBp != null) {
+					try {
+						String condition = underlyingBp.isConditionEnabled() ? lineBp.getCondition() : null;
+						String suspendStrategy = underlyingBp.isConditionSuspendOnTrue() ? 
+								JavaScriptBreakpointDesc.SUSPEND_ON_TRUE :
+								JavaScriptBreakpointDesc.SUSPEND_ON_CHANGE;
+						lineBp = lineBp.setCondition(condition);
+						lineBp = lineBp.setConditionSuspend(suspendStrategy);
+					} catch (CoreException e) {
+						CoreMoSyncPlugin.getDefault().log(e);
+					}
+				}
+			}
+			return lineBp;
 		}
 
 		private JavaScriptBreakpointDesc toInternalFormat(
@@ -948,7 +992,7 @@ public class JSODDServer implements IResourceChangeListener {
 			ResourcesPlugin.getWorkspace().addResourceChangeListener(this,
 					IResourceChangeEvent.POST_CHANGE);
 			server = new Server(getPort());
-			server.setThreadPool(new QueuedThreadPool(5));
+			server.setThreadPool(new ExecutorThreadPool(5, 128, 120));
 			server.setHandler(new JSODDServerHandler());
 			Connector connector = new SelectChannelConnector();
 			connector.setPort(getPort());
@@ -1194,6 +1238,7 @@ public class JSODDServer implements IResourceChangeListener {
 				// Just to make sure the terminate request is sent
 				// before the server is killed.
 				Thread.sleep(1000 * getTimeout(sessionId));
+				queues.killSession(sessionId);
 			}
 		} catch (Exception e) {
 			CoreMoSyncPlugin.getDefault().log(e);
@@ -1238,7 +1283,7 @@ public class JSODDServer implements IResourceChangeListener {
 	public void resourceChanged(IResourceChangeEvent event) {
 		if (Html5Plugin.getDefault().getSourceChangeStrategy() == Html5Plugin.DO_NOTHING) {
 			// Just return!
-			//return;
+			return;
 		}
 
 		List<ReloadVirtualMachine> vms = getVMs(false);
@@ -1252,6 +1297,8 @@ public class JSODDServer implements IResourceChangeListener {
 		}
 
 		IResourceDelta delta = event.getDelta();
+		
+		final boolean[] requiredRewrite = new boolean[] { false };
 
 		// This code seems to be repeated elsewhere; refactor! TODO!
 		if (delta != null) {
@@ -1272,6 +1319,7 @@ public class JSODDServer implements IResourceChangeListener {
 								if (replacement == null) {
 									return false;
 								}
+								requiredRewrite[0] = true;
 								JSODDSupport jsoddSupport = Html5Plugin
 										.getDefault().getJSODDSupport(project);
 								if (delta.getKind() == IResourceDelta.REMOVED) {
@@ -1292,6 +1340,10 @@ public class JSODDServer implements IResourceChangeListener {
 			}
 		}
 
+		if (!requiredRewrite[0]) {
+			return;
+		}
+		
 		int failedRedefineResolution = 0;
 		for (ReloadVirtualMachine vm : vms) {
 			IProject project = vm.getProject();
